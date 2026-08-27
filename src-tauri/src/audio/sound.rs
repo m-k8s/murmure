@@ -17,6 +17,8 @@ pub const MAX_RELEASE_DELAY_MS: u64 = 60_000;
 /// user can pick, so the stream never closes mid-dictation.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(MIN_RELEASE_DELAY_MS / 2);
 pub const STREAM_WARMUP_DURATION: Duration = Duration::from_millis(100);
+/// Bounded, so a device that never wakes up delays a recording instead of blocking it.
+const READY_MAX_WAIT: Duration = Duration::from_millis(1500);
 
 const MAX_SOUND_GAIN: f32 = 11.0;
 
@@ -55,6 +57,7 @@ enum SoundRequest {
     Play(Sound, f32),
     Prewarm,
     KeepAlive,
+    ReportReady(Sender<()>),
 }
 
 pub struct SoundManager {
@@ -127,6 +130,11 @@ pub fn init_sound_system(app: &AppHandle) {
             match received {
                 // Re-arms the idle timeout by falling back to the loop; never opens.
                 Ok(SoundRequest::KeepAlive) => continue,
+                // Answered only after every earlier request: hence a barrier.
+                Ok(SoundRequest::ReportReady(ack)) => {
+                    let _ = ack.send(());
+                    continue;
+                }
                 Ok(request) => {
                     // Not per loop turn: a keepalive must stay a bare channel send.
                     idle_timeout = release_delay(&app_handle);
@@ -195,6 +203,31 @@ pub fn play_sound(app: &AppHandle, sound: Sound) {
     } else {
         warn!("SoundManager not initialized");
     }
+}
+
+/// Blocks until the sound thread has handled every request queued before this call, so a
+/// preceding [`prewarm`] is known to have opened and warmed up the device. One thread
+/// serves them in order, hence the guarantee. `false` when the bounded wait expired.
+pub fn wait_until_ready(app: &AppHandle) -> bool {
+    let Some(manager) = app.try_state::<SoundManager>() else {
+        return false;
+    };
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    if manager.tx.send(SoundRequest::ReportReady(ack_tx)).is_err() {
+        return false;
+    }
+    let started = std::time::Instant::now();
+    let ready = ack_rx.recv_timeout(READY_MAX_WAIT).is_ok();
+    let waited = started.elapsed();
+    if ready {
+        info!("Output device ready after {:?}", waited);
+    } else {
+        warn!(
+            "Output device still not ready after {:?}; starting the capture anyway",
+            waited
+        );
+    }
+    ready
 }
 
 /// Re-arms the idle timeout so a long dictation does not end on a sleeping device.
