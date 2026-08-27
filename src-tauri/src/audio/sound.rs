@@ -9,7 +9,16 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// The output stream is closed after this long without a request so the device can go
+// back to sleep. Bluetooth headsets and hearing aids hold their audio profile for as
+// long as the stream is open, so this stays short: it only has to outlast the longest
+// beep (stop_record.mp3, 287 ms) plus the buffering of a Bluetooth sink, which the
+// stream drop would otherwise cut off.
+const STREAM_IDLE_TIMEOUT_MS: u64 = 2_000;
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
+/// Interval at which a recording must ping the sound thread to hold the output stream
+/// open. Below STREAM_IDLE_TIMEOUT so the stream never closes mid-dictation.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(STREAM_IDLE_TIMEOUT_MS / 2);
 pub const STREAM_WARMUP_DURATION: Duration = Duration::from_millis(100);
 
 const MAX_SOUND_GAIN: f32 = 11.0;
@@ -40,6 +49,7 @@ impl Sound {
 enum SoundRequest {
     Play(Sound, f32),
     Prewarm,
+    KeepAlive,
 }
 
 pub struct SoundManager {
@@ -109,6 +119,9 @@ pub fn init_sound_system(app: &AppHandle) {
             };
 
             match received {
+                // Falling back to the loop re-arms the idle timeout above. A keepalive
+                // never opens the stream, so it cannot wake a device that was released.
+                Ok(SoundRequest::KeepAlive) => continue,
                 Ok(request) => {
                     let just_opened = stream_handle.is_none();
                     if just_opened {
@@ -177,6 +190,14 @@ pub fn play_sound(app: &AppHandle, sound: Sound) {
     }
 }
 
+/// Holds an already open output stream open a bit longer, so a long dictation does not
+/// end on a device that just went back to sleep. Never opens the stream by itself.
+pub fn keep_alive(app: &AppHandle) {
+    if let Some(manager) = app.try_state::<SoundManager>() {
+        let _ = manager.tx.send(SoundRequest::KeepAlive);
+    }
+}
+
 /// Opens and warms up the output stream ahead of the next sound.
 /// No-op when sounds are disabled.
 pub fn prewarm(app: &AppHandle) {
@@ -215,6 +236,17 @@ mod tests {
     #[test]
     fn clamps_above_the_maximum() {
         assert_eq!(gain_from_percent(255), gain_from_percent(100));
+    }
+
+    #[test]
+    fn keepalive_interval_holds_the_stream_open() {
+        assert!(KEEPALIVE_INTERVAL < STREAM_IDLE_TIMEOUT);
+    }
+
+    #[test]
+    fn idle_timeout_outlasts_the_longest_beep() {
+        let longest_beep = Duration::from_millis(300);
+        assert!(STREAM_IDLE_TIMEOUT > STREAM_WARMUP_DURATION + longest_beep);
     }
 
     #[test]
