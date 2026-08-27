@@ -9,22 +9,27 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
-// The output stream is closed after this long without a request so the device can go
-// back to sleep. Bluetooth headsets and hearing aids hold their audio profile for as
-// long as the stream is open, so this stays short: it only has to outlast the longest
-// beep (stop_record.mp3, 287 ms) plus the buffering of a Bluetooth sink, which the
-// stream drop would otherwise cut off.
-const STREAM_IDLE_TIMEOUT_MS: u64 = 2_000;
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
-/// Interval at which a recording must ping the sound thread to hold the output stream
-/// open. Below STREAM_IDLE_TIMEOUT so the stream never closes mid-dictation.
-pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(STREAM_IDLE_TIMEOUT_MS / 2);
+/// Floor: the longest beep (stop_record.mp3, 287 ms) and the buffering of a Bluetooth
+/// sink must drain before the stream is dropped, or the sound is cut short.
+pub const MIN_RELEASE_DELAY_MS: u64 = 2_000;
+pub const MAX_RELEASE_DELAY_MS: u64 = 60_000;
+/// Ping interval holding the stream open during a recording. Below the shortest delay the
+/// user can pick, so the stream never closes mid-dictation.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(MIN_RELEASE_DELAY_MS / 2);
 pub const STREAM_WARMUP_DURATION: Duration = Duration::from_millis(100);
 
 const MAX_SOUND_GAIN: f32 = 11.0;
 
 pub const MIN_SOUND_VOLUME_PERCENT: u8 = 10;
 pub const MAX_SOUND_VOLUME_PERCENT: u8 = 100;
+
+fn clamp_release_delay(configured_ms: u64) -> Duration {
+    Duration::from_millis(configured_ms.clamp(MIN_RELEASE_DELAY_MS, MAX_RELEASE_DELAY_MS))
+}
+
+fn release_delay(app: &AppHandle) -> Duration {
+    clamp_release_delay(crate::settings::load_settings(app).output_release_delay_ms)
+}
 
 fn gain_from_percent(percent: u8) -> f32 {
     let percent = percent.clamp(MIN_SOUND_VOLUME_PERCENT, MAX_SOUND_VOLUME_PERCENT);
@@ -110,19 +115,21 @@ pub fn init_sound_system(app: &AppHandle) {
         );
 
         let mut stream_handle: Option<rodio::MixerDeviceSink> = None;
+        let mut idle_timeout = release_delay(&app_handle);
 
         loop {
             let received = if stream_handle.is_some() {
-                rx.recv_timeout(STREAM_IDLE_TIMEOUT)
+                rx.recv_timeout(idle_timeout)
             } else {
                 rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
             };
 
             match received {
-                // Falling back to the loop re-arms the idle timeout above. A keepalive
-                // never opens the stream, so it cannot wake a device that was released.
+                // Re-arms the idle timeout by falling back to the loop; never opens.
                 Ok(SoundRequest::KeepAlive) => continue,
                 Ok(request) => {
+                    // Not per loop turn: a keepalive must stay a bare channel send.
+                    idle_timeout = release_delay(&app_handle);
                     let just_opened = stream_handle.is_none();
                     if just_opened {
                         stream_handle = open_output_stream();
@@ -190,8 +197,8 @@ pub fn play_sound(app: &AppHandle, sound: Sound) {
     }
 }
 
-/// Holds an already open output stream open a bit longer, so a long dictation does not
-/// end on a device that just went back to sleep. Never opens the stream by itself.
+/// Re-arms the idle timeout so a long dictation does not end on a sleeping device.
+/// Never opens the stream by itself.
 pub fn keep_alive(app: &AppHandle) {
     if let Some(manager) = app.try_state::<SoundManager>() {
         let _ = manager.tx.send(SoundRequest::KeepAlive);
@@ -240,13 +247,34 @@ mod tests {
 
     #[test]
     fn keepalive_interval_holds_the_stream_open() {
-        assert!(KEEPALIVE_INTERVAL < STREAM_IDLE_TIMEOUT);
+        assert!(KEEPALIVE_INTERVAL < clamp_release_delay(MIN_RELEASE_DELAY_MS));
     }
 
     #[test]
-    fn idle_timeout_outlasts_the_longest_beep() {
+    fn shortest_delay_outlasts_the_longest_beep() {
         let longest_beep = Duration::from_millis(300);
-        assert!(STREAM_IDLE_TIMEOUT > STREAM_WARMUP_DURATION + longest_beep);
+        assert!(clamp_release_delay(MIN_RELEASE_DELAY_MS) > STREAM_WARMUP_DURATION + longest_beep);
+    }
+
+    #[test]
+    fn release_delay_keeps_a_value_within_range() {
+        assert_eq!(clamp_release_delay(10_000), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn release_delay_clamps_below_the_floor() {
+        assert_eq!(
+            clamp_release_delay(0),
+            clamp_release_delay(MIN_RELEASE_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn release_delay_clamps_above_the_ceiling() {
+        assert_eq!(
+            clamp_release_delay(10 * MAX_RELEASE_DELAY_MS),
+            clamp_release_delay(MAX_RELEASE_DELAY_MS)
+        );
     }
 
     #[test]
